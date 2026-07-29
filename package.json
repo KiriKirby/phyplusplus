@@ -1,0 +1,16 @@
+{
+  "name": "phyplusplus",
+  "version": "1.0.0",
+  "description": "Install `phyplusplus.user.js` in Tampermonkey, then open Phytozome. The script enhances genome choices and BLAST result tables, including sequence copy and Save As exports.",
+  "main": "phyplusplus.user.js",
+  "scripts": {
+    "test": "node --test test/phyplusplus.test.cjs"
+  },
+  "keywords": [],
+  "author": "wangsychn",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}
