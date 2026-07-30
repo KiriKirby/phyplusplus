@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Phy++ for Phytozome
 // @namespace    https://phytozome-next.jgi.doe.gov/
-// @version      3.6.1
+// @version      3.7.0
 // @description  Adds dates, identifiers, sequence tools, and exports to Phytozome.
 // @license      MIT
 // @homepageURL  https://github.com/KiriKirby/phyplusplus
@@ -550,13 +550,32 @@ function phyplusplusMain() {
     if (document.getElementById('phypp-species-suffix-style')) return;
     const style = document.createElement('style');
     style.id = 'phypp-species-suffix-style';
-    style.textContent = '.react-autosuggest__suggestion .name[data-phypp-suffix]::after,.rct-title.large-screen[data-phypp-suffix]::after{content:attr(data-phypp-suffix);white-space:pre;color:inherit;font:inherit}';
+    style.textContent = '.react-autosuggest__suggestion .name[data-phypp-suffix]::after,.rct-title.large-screen[data-phypp-suffix]::after,#adf a[data-phypp-suffix]::after{content:attr(data-phypp-suffix);white-space:pre;color:inherit;font:inherit}';
     (document.head || document.documentElement).append(style);
   }
 
   function formatSpeciesSuffix(id) {
     const date = GENOME_METADATA.get(id);
     return `${date ? ` ${date}` : ''} (id${id})`;
+  }
+
+  function compactDate(value) {
+    const text = String(value || '').trim();
+    const numeric = text.match(/^(\d{4})[-./](\d{1,2})[-./](\d{1,2})$/);
+    if (numeric) return `${numeric[1]}.${numeric[2].padStart(2, '0')}.${numeric[3].padStart(2, '0')}`;
+    const named = text.match(/^([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$/);
+    const month = named && ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(named[1].slice(0, 3).toLowerCase());
+    if (named && month >= 0) return `${named[3]}.${String(month + 1).padStart(2, '0')}.${named[2].padStart(2, '0')}`;
+    return '';
+  }
+
+  function genomeIdsByInfoPath() {
+    const ids = new Map();
+    document.querySelectorAll('.rct-text a[href^="/info/"]').forEach(link => {
+      const id = link.closest('.rct-text')?.querySelector('input[id]')?.id.match(/-(\d+)$/)?.[1];
+      if (id) ids.set(link.getAttribute('href'), id);
+    });
+    return ids;
   }
 
   function drainMetadataQueue() {
@@ -592,6 +611,16 @@ function phyplusplusMain() {
 
   function decorateSpeciesOptions() {
     installSpeciesSuffixStyle();
+    const idsByInfoPath = genomeIdsByInfoPath();
+    document.querySelectorAll('#adf tbody tr').forEach(row => {
+      const link = row.querySelector('a[href^="/info/"]');
+      const id = link && idsByInfoPath.get(link.getAttribute('href'));
+      if (!link || !id) return;
+      const date = compactDate(row.cells?.[2]?.textContent?.trim());
+      if (date) GENOME_METADATA.set(id, date);
+      link.dataset.phyppSuffix = formatSpeciesSuffix(id);
+      requestGenomeMetadata(id);
+    });
     const suggestions = document.querySelectorAll('.react-autosuggest__suggestion .name[data-pid]');
     suggestions.forEach(title => {
       const id = title.dataset.pid;
@@ -732,8 +761,9 @@ function phyplusplusMain() {
   let speciesObserver;
   let speciesQueryGeneration = 0;
   let speciesLastQuery = '';
+  const SPECIES_INPUT_SELECTOR = '.react-autosuggest__container input,input[aria-autocomplete="list"],input[placeholder^="Choose genomes by selecting"]';
   function speciesSearchValue() {
-    const input = document.querySelector('.react-autosuggest__container input, input[aria-autocomplete="list"]');
+    const input = document.querySelector(SPECIES_INPUT_SELECTOR);
     return input?.value || '';
   }
 
@@ -766,14 +796,14 @@ function phyplusplusMain() {
   }
 
   document.addEventListener('input', event => {
-    if (event.target.matches('.react-autosuggest__container input, input[aria-autocomplete="list"]')) scheduleSpeciesDecoration();
+    if (event.target.matches(SPECIES_INPUT_SELECTOR)) scheduleSpeciesDecoration();
   }, true);
   document.addEventListener('focusin', event => {
-    if (event.target.matches('.react-autosuggest__container input, input[aria-autocomplete="list"]')) scheduleSpeciesDecoration();
+    if (event.target.matches(SPECIES_INPUT_SELECTOR)) scheduleSpeciesDecoration();
   }, true);
 
   function isSpeciesSuggestionMutation(record) {
-    const selector = '.react-autosuggest__container,.react-autosuggest__suggestions-container,.react-autosuggest__suggestion';
+    const selector = '.react-autosuggest__container,.react-autosuggest__suggestions-container,.react-autosuggest__suggestion,#adf,.rct-text';
     if (record.target.nodeType === Node.ELEMENT_NODE && record.target.closest?.(selector)) return true;
     return [...record.addedNodes, ...record.removedNodes].some(node =>
       node.nodeType === Node.ELEMENT_NODE && (node.matches?.(selector) || node.querySelector?.(selector)));
@@ -792,14 +822,9 @@ function phyplusplusMain() {
   scheduleSpeciesDecoration();
 }
 
-// Tampermonkey may run `@grant none` scripts in an isolated world.  Install
-// the hook in Phytozome's page world so it sees the site's webpack queue.
-if (!window.__phyppPageWorld) {
-  window.__phyppPageWorld = true;
-  const script = document.createElement('script');
-  script.textContent = `;(${phyplusplusMain.toString()})();`;
-  // `document-start` can precede <html>; the parser's current script is a
-  // stable insertion point in that short interval.
-  (document.documentElement || document.head || document.currentScript || document).append(script);
-  script.remove();
+// `@sandbox raw` executes in the page world. Running directly avoids a
+// CSP-sensitive inline-script injection while retaining access to webpack.
+if (!window.__phyppMainInstalled) {
+  window.__phyppMainInstalled = true;
+  phyplusplusMain();
 }

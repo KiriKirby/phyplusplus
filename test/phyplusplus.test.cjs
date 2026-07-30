@@ -7,30 +7,26 @@ const source = readFileSync('phyplusplus.user.js', 'utf8');
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-test('updates species suffixes after delayed React suggestions settle without rewriting text', async () => {
+test('decorates the live MUI genome-search result table without rewriting labels', async () => {
   const dom = new JSDOM(`<!doctype html><body>
-    <div class="react-autosuggest__container"><input aria-autocomplete="list"></div>
-  </body>`, { runScripts: 'dangerously', url: 'https://phytozome-next.jgi.doe.gov/blast' });
+    <input placeholder="Choose genomes by selecting from tree or type genus/species/common name">
+    <div id="adf"><table><tbody>
+      <tr><td><a href="/info/Ptrichocarpa_v4_1">Populus trichocarpa v4.1</a></td><td>western poplar</td><td>Nov 5, 2019</td></tr>
+    </tbody></table></div>
+    <span class="rct-text"><label><input id="rct-test-533" type="checkbox"><span class="rct-title large-screen">Populus trichocarpa v4.1</span></label><a href="/info/Ptrichocarpa_v4_1">Info</a></span>
+  </body>`, { runScripts: 'dangerously', url: 'https://phytozome-next.jgi.doe.gov/' });
   const { window } = dom;
-  let metadataCalls = 0;
-  window.fetch = async url => {
-    assert.match(String(url), /\/api\/db\/properties\/proteome\/533$/);
-    metadataCalls++;
-    return { ok: true, json: async () => [{ xrefs: [{ release_date: '2021-04-29' }] }] };
-  };
+  window.fetch = async () => { throw new Error('The visible release date should avoid an API request.'); };
   window.eval(source);
   const input = window.document.querySelector('input');
-  input.value = 'ptr';
+  input.value = 'Populus trichocarpa';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
-  await wait(120);
-  window.document.body.insertAdjacentHTML('beforeend', '<div class="react-autosuggest__suggestion"><div class="name" data-pid="533">P. trichocarpa v4.1</div></div>');
   await wait(450);
-  const title = window.document.querySelector('.name[data-pid="533"]');
-  assert.equal(title.textContent, 'P. trichocarpa v4.1');
-  assert.equal(title.dataset.phyppSuffix, ' (id533)');
-  await wait(450);
-  assert.equal(title.dataset.phyppSuffix, ' 2021.04.29 (id533)');
-  assert.equal(metadataCalls, 1);
+  const link = window.document.querySelector('#adf a');
+  const title = window.document.querySelector('.rct-title.large-screen');
+  assert.equal(link.textContent, 'Populus trichocarpa v4.1');
+  assert.equal(link.dataset.phyppSuffix, ' 2019.11.05 (id533)');
+  assert.equal(title.dataset.phyppSuffix, ' 2019.11.05 (id533)');
 });
 
 test('injects into the page world and intercepts the native AgGridReact module before construction', async () => {
@@ -56,7 +52,7 @@ test('injects into the page world and intercepts the native AgGridReact module b
   let workbook;
   window.XLSX = { utils: { book_new: () => (workbook = {}), aoa_to_sheet: rows => ({ rows }), book_append_sheet: (book, sheet) => { book.sheet = sheet; } }, write: () => Uint8Array.from([1]) };
   window.eval(source);
-  assert.equal(window.__phyppPageWorld, true);
+  assert.equal(window.__phyppMainInstalled, true);
 
   class OriginalAgGridReact { constructor(props) { this.props = props; } }
   // The live vendor bundle uses an array-indexed webpack module table.
