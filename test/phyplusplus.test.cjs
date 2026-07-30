@@ -7,26 +7,30 @@ const source = readFileSync('phyplusplus.user.js', 'utf8');
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-test('updates species suffixes after typing settles without rewriting React-owned text', async () => {
+test('updates species suffixes after delayed React suggestions settle without rewriting text', async () => {
   const dom = new JSDOM(`<!doctype html><body>
     <div class="react-autosuggest__container"><input aria-autocomplete="list"></div>
-    <div class="react-autosuggest__suggestion"><div class="name" data-pid="533">P. trichocarpa v4.1</div></div>
   </body>`, { runScripts: 'dangerously', url: 'https://phytozome-next.jgi.doe.gov/blast' });
   const { window } = dom;
+  let metadataCalls = 0;
   window.fetch = async url => {
     assert.match(String(url), /\/api\/db\/properties\/proteome\/533$/);
+    metadataCalls++;
     return { ok: true, json: async () => [{ xrefs: [{ release_date: '2021-04-29' }] }] };
   };
   window.eval(source);
   const input = window.document.querySelector('input');
   input.value = 'ptr';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await wait(120);
+  window.document.body.insertAdjacentHTML('beforeend', '<div class="react-autosuggest__suggestion"><div class="name" data-pid="533">P. trichocarpa v4.1</div></div>');
   await wait(450);
   const title = window.document.querySelector('.name[data-pid="533"]');
   assert.equal(title.textContent, 'P. trichocarpa v4.1');
   assert.equal(title.dataset.phyppSuffix, ' (id533)');
   await wait(450);
   assert.equal(title.dataset.phyppSuffix, ' 2021.04.29 (id533)');
+  assert.equal(metadataCalls, 1);
 });
 
 test('injects into the page world and intercepts the native AgGridReact module before construction', async () => {
@@ -90,6 +94,11 @@ test('injects into the page world and intercepts the native AgGridReact module b
   const proteinColumn = options.columnDefs.find(column => column.field === 'Hsp_hit-sequenceId');
   assert.equal(proteinColumn.cellStyle({ value: 'protein-1', data: row }), undefined);
 
+  // Version-group requests start while the native grid is being constructed,
+  // rather than waiting for its ready callback.
+  for (let attempt = 0; attempt < 20 && !row._phyppProteinGroup; attempt++) await wait(10);
+  assert.equal(row._phyppProteinGroup, 'shared-protein');
+
   const selected = [row];
   let refreshCount = 0;
   const api = {
@@ -102,8 +111,7 @@ test('injects into the page world and intercepts the native AgGridReact module b
     getSortModel: () => [{ colId: 'Hsp_hit-sequenceId', sort: 'asc' }],
   };
   options.onGridReady({ api });
-  for (let attempt = 0; attempt < 20 && !row._phyppProteinGroup; attempt++) await wait(10);
-  assert.equal(row._phyppProteinGroup, 'shared-protein');
+  for (let attempt = 0; attempt < 20 && row._phyppPeptide === 'Loading...'; attempt++) await wait(10);
   assert.equal(row._phyppPeptide, '>P.test|protein-1\nMPEPTIDE');
   options.onSortChanged({ api });
   assert.equal(proteinColumn.cellStyle({ value: 'protein-1', data: row }).color, '#d00000');
@@ -115,6 +123,7 @@ test('injects into the page world and intercepts the native AgGridReact module b
   options.onSortChanged({ api, columnApi: legacyColumnApi });
   assert.equal(proteinColumn.cellStyle({ value: 'protein-1', data: row }).color, '#d00000');
   options.onSortChanged({ api, columnApi: { getColumn: () => ({ getSort: () => null }) } });
+  await wait(10);
   assert.equal(proteinColumn.cellStyle({ value: 'protein-1', data: row }), undefined);
 
   const view = options.columnDefs[0].cellRenderer({ data: row });

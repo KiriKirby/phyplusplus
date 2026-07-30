@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Phy++ for Phytozome
 // @namespace    https://phytozome-next.jgi.doe.gov/
-// @version      3.6.0
+// @version      3.6.1
 // @description  Adds dates, identifiers, sequence tools, and exports to Phytozome.
 // @license      MIT
 // @homepageURL  https://github.com/KiriKirby/phyplusplus
@@ -104,25 +104,37 @@ function phyplusplusMain() {
     return task;
   }
 
-  async function loadProteinGroups(rows, api) {
+  async function loadProteinGroups(rows) {
     await concurrentMap(rows, async row => { row._phyppProteinGroup = await fetchProteinGroup(row); });
     const counts = new Map();
     rows.forEach(row => {
       if (row._phyppProteinGroup) counts.set(row._phyppProteinGroup, (counts.get(row._phyppProteinGroup) || 0) + 1);
     });
     rows.forEach(row => { row._phyppProteinInGroup = (counts.get(row._phyppProteinGroup) || 0) > 1; });
-    api.refreshCells?.({ force: true, columns: ['Hsp_hit-sequenceId'] });
   }
 
   function isProteinSortActive(api, eventColumnApi) {
-    const sortModel = api.getSortModel?.();
+    const sortModel = api?.getSortModel?.();
     if (Array.isArray(sortModel)) return sortModel.some(sort => sort.colId === 'Hsp_hit-sequenceId');
-    const columnApi = eventColumnApi || api.columnApi;
-    const proteinColumn = columnApi?.getColumn?.('Hsp_hit-sequenceId');
-    if (proteinColumn?.isSortActive?.()) return true;
-    if (proteinColumn?.getSort?.()) return true;
-    return (columnApi?.getAllColumns?.() || []).some(column =>
-      column.getColId?.() === 'Hsp_hit-sequenceId' && (column.isSortActive?.() || column.getSort?.()));
+    const columnApis = [...new Set([api?.columnApi, eventColumnApi].filter(Boolean))];
+    return columnApis.some(columnApi => {
+      const proteinColumn = columnApi.getColumn?.('Hsp_hit-sequenceId');
+      if (proteinColumn?.isSortActive?.() || ['asc', 'desc'].includes(proteinColumn?.getSort?.())) return true;
+      const allColumns = columnApi.getAllColumns?.() || columnApi.getAllGridColumns?.() || columnApi.getAllDisplayedColumns?.() || [];
+      return allColumns.some(column => column.getColId?.() === 'Hsp_hit-sequenceId' &&
+        (column.isSortActive?.() || ['asc', 'desc'].includes(column.getSort?.())));
+    });
+  }
+
+  function refreshProteinHighlight(api, options, eventColumnApi) {
+    const refresh = () => {
+      options.__phyppProteinSortActive = isProteinSortActive(api, eventColumnApi);
+      api?.refreshCells?.({ force: true, columns: ['Hsp_hit-sequenceId'] });
+    };
+    refresh();
+    // Some older AG Grid builds dispatch sortChanged before their column state
+    // has settled. Re-check on the next frame so stale red styles are removed.
+    (window.requestAnimationFrame || setTimeout)(refresh);
   }
 
   function enhanceNativeGridOptions(options) {
@@ -164,12 +176,15 @@ function phyplusplusMain() {
       row._phyppLink = nativeReportUrl(row);
       row._phyppPeptide = 'Loading...';
     });
+    // Begin API-backed version grouping before the native grid is mounted.
+    // The result is calculated once and merely shown/hidden as Protein sorting
+    // changes, avoiding repeat work and delayed highlight state.
+    const proteinGroupsReady = loadProteinGroups(options.rowData);
     const previousReady = options.onGridReady;
     const previousSortChanged = options.onSortChanged;
     options.onSortChanged = event => {
       previousSortChanged?.(event);
-      options.__phyppProteinSortActive = isProteinSortActive(event.api, event.columnApi);
-      event.api.refreshCells?.({ force: true, columns: ['Hsp_hit-sequenceId'] });
+      refreshProteinHighlight(event.api, options, event.columnApi);
     };
     options.onGridReady = event => {
       previousReady?.(event);
@@ -187,7 +202,8 @@ function phyplusplusMain() {
         row._phyppPeptide = fasta || 'Unavailable';
         refreshPeptides();
       });
-      loadProteinGroups(rows, event.api);
+      proteinGroupsReady.then(() => refreshProteinHighlight(event.api, options));
+      refreshProteinHighlight(event.api, options);
       setTimeout(() => addNativeOutput(event.api, options), 0);
     };
   }
@@ -712,20 +728,40 @@ function phyplusplusMain() {
   }
 
   let speciesTimer;
+  let speciesRetryTimer;
+  let speciesObserver;
+  let speciesQueryGeneration = 0;
   let speciesLastQuery = '';
   function speciesSearchValue() {
     const input = document.querySelector('.react-autosuggest__container input, input[aria-autocomplete="list"]');
     return input?.value || '';
   }
 
-  // Update only after a pause in typing.  DOM changes do not schedule another
-  // pass, preventing React's suggestion rerenders from feeding back into us.
+  function decorateSpeciesOptionsWhenStable(query, generation) {
+    if (speciesSearchValue() !== query || generation !== speciesQueryGeneration) return;
+    decorateSpeciesOptions();
+    // React can replace suggestions shortly after the input event. One short
+    // confirmation pass catches that replacement without touching its text.
+    clearTimeout(speciesRetryTimer);
+    speciesRetryTimer = setTimeout(() => {
+      if (speciesSearchValue() === query && generation === speciesQueryGeneration) decorateSpeciesOptions();
+    }, 120);
+  }
+
+  // Wait for typing to settle, then decorate the complete current suggestion
+  // list. A child-list observer catches React's delayed suggestion rendering;
+  // CSS attributes avoid feedback into React-owned text nodes.
   function scheduleSpeciesDecoration() {
     clearTimeout(speciesTimer);
+    const query = speciesSearchValue();
+    if (query !== speciesLastQuery) {
+      speciesLastQuery = query;
+      speciesQueryGeneration++;
+      clearTimeout(speciesRetryTimer);
+    }
+    const generation = speciesQueryGeneration;
     speciesTimer = setTimeout(() => {
-      const query = speciesSearchValue();
-      if (query !== speciesLastQuery) speciesLastQuery = query;
-      decorateSpeciesOptions();
+      decorateSpeciesOptionsWhenStable(query, generation);
     }, SPECIES_DEBOUNCE_MS);
   }
 
@@ -735,6 +771,24 @@ function phyplusplusMain() {
   document.addEventListener('focusin', event => {
     if (event.target.matches('.react-autosuggest__container input, input[aria-autocomplete="list"]')) scheduleSpeciesDecoration();
   }, true);
+
+  function isSpeciesSuggestionMutation(record) {
+    const selector = '.react-autosuggest__container,.react-autosuggest__suggestions-container,.react-autosuggest__suggestion';
+    if (record.target.nodeType === Node.ELEMENT_NODE && record.target.closest?.(selector)) return true;
+    return [...record.addedNodes, ...record.removedNodes].some(node =>
+      node.nodeType === Node.ELEMENT_NODE && (node.matches?.(selector) || node.querySelector?.(selector)));
+  }
+
+  function startSpeciesObserver() {
+    if (speciesObserver || !document.documentElement) return;
+    speciesObserver = new MutationObserver(records => {
+      if (records.some(isSpeciesSuggestionMutation)) scheduleSpeciesDecoration();
+    });
+    speciesObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  startSpeciesObserver();
+  if (!speciesObserver) document.addEventListener('DOMContentLoaded', startSpeciesObserver, { once: true });
   scheduleSpeciesDecoration();
 }
 
