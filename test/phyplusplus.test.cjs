@@ -36,8 +36,13 @@ test('injects into the page world and intercepts the native AgGridReact module b
   const { window } = dom;
   const saves = [];
   let clipboard = '';
+  const alerts = [];
   window.fetch = async url => {
     const value = String(url);
+    const report = value.match(/\/report\/protein\/[^/]+\/([^/?]+)/);
+    if (report) {
+      return { ok: true, text: async () => `<h3>Peptide sequence</h3><pre>>raw-${report[1]}\nRAWPEPTIDE</pre>` };
+    }
     if (/\/api\/db\/sequence\/protein\/99$/.test(value)) {
       return { ok: true, json: async () => [{ organism: 'P.test', phytozome_genome_id: '533', residues: 'MPEPTIDE*' }] };
     }
@@ -48,6 +53,8 @@ test('injects into the page world and intercepts the native AgGridReact module b
     throw new Error(`Unexpected request: ${value}`);
   };
   window.navigator.clipboard = { writeText: async value => { clipboard = value; } };
+  window.alert = message => { alerts.push(message); };
+  window.console.warn = () => {};
   window.showSaveFilePicker = async options => ({ createWritable: async () => ({ write: async value => saves.push({ options, value }), close: async () => {} }) });
   let workbook;
   window.XLSX = { utils: { book_new: () => (workbook = {}), aoa_to_sheet: rows => ({ rows }), book_append_sheet: (book, sheet) => { book.sheet = sheet; } }, write: () => Uint8Array.from([1]) };
@@ -129,17 +136,43 @@ test('injects into the page world and intercepts the native AgGridReact module b
 
   window.document.querySelector('.phypp-output > button').click();
   selected.push({ ...row, 'Hsp_hit-sequenceId': 'protein-2' });
-  const fastaButton = [...window.document.querySelectorAll('.phypp-output-menu button')].find(button => button.textContent === 'Export FASTA');
-  assert.equal(fastaButton.parentElement.parentElement, window.document.body);
-  fastaButton.click();
-  await flush();
+  const outputButtons = [...window.document.querySelectorAll('.phypp-output-menu button')];
+  assert.deepEqual(outputButtons.map(button => button.textContent), [
+    'Export FASTA (Standard)', 'Export FASTA (Conservative)',
+    'Export table (Standard)', 'Export table (Conservative)',
+  ]);
+  const standardFasta = outputButtons.find(button => button.textContent === 'Export FASTA (Standard)');
+  assert.equal(standardFasta.parentElement.parentElement, window.document.body);
+  standardFasta.click();
+  await wait(10);
   assert.equal(saves[0].value, '>P.test|protein-1\nMPEPTIDE\n\n>P.test|protein-2\nMPEPTIDE');
   assert.equal('suggestedName' in saves[0].options, false);
 
-  window.document.querySelector('.phypp-output > button').click();
-  [...window.document.querySelectorAll('.phypp-output-menu button')].find(button => button.textContent === 'Export table').click();
-  await flush();
+  const conservativeFasta = outputButtons.find(button => button.textContent === 'Export FASTA (Conservative)');
+  conservativeFasta.click();
+  assert.ok(window.document.querySelector('#phypp-export-loading'));
+  await wait(10);
+  assert.equal(window.document.querySelector('#phypp-export-loading'), null);
+  assert.equal(saves[1].value, '>raw-protein-1\nRAWPEPTIDE\n\n>raw-protein-2\nRAWPEPTIDE');
+
+  const standardTable = outputButtons.find(button => button.textContent === 'Export table (Standard)');
+  standardTable.click();
+  await wait(10);
   assert.deepEqual(workbook.sheet.rows[0], ['Views', 'Protein', 'E-value', '% identity', '% Query Coverage', 'Align len', 'Link', 'Peptide sequence']);
   assert.equal(workbook.sheet.rows[1][4], 50);
-  assert.equal('suggestedName' in saves[1].options, false);
+  assert.equal(workbook.sheet.rows[1][7], '>P.test|protein-1\nMPEPTIDE');
+  assert.equal('suggestedName' in saves[2].options, false);
+
+  const conservativeTable = outputButtons.find(button => button.textContent === 'Export table (Conservative)');
+  conservativeTable.click();
+  await wait(10);
+  assert.equal(workbook.sheet.rows[1][7], '>raw-protein-1\nRAWPEPTIDE');
+  assert.equal('suggestedName' in saves[3].options, false);
+
+  selected.splice(0, selected.length, { ...row, Hit_accession: 'missing', 'Hsp_hit-sequenceId': 'missing-protein' });
+  standardFasta.click();
+  await wait(10);
+  assert.match(alerts.at(-1), /Export cancelled\. 1 selected protein report\(s\) failed:/);
+  assert.match(alerts.at(-1), /missing-protein/);
+  assert.equal(saves.length, 4);
 });

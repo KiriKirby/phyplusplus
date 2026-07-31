@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Phy++ for Phytozome
 // @namespace    https://phytozome-next.jgi.doe.gov/
-// @version      3.7.0
+// @version      3.8.0
 // @description  Adds dates, identifiers, sequence tools, and exports to Phytozome.
 // @license      MIT
 // @homepageURL  https://github.com/KiriKirby/phyplusplus
@@ -18,6 +18,7 @@ function phyplusplusMain() {
   'use strict';
 
   const CACHE = new Map();
+  const SEQUENCE_ERRORS = new Map();
   const PROTEIN_RECORD_CACHE = new Map();
   const PROTEIN_GROUP_CACHE = new Map();
   const PROTEOME_IDS = new Map();
@@ -61,11 +62,118 @@ function phyplusplusMain() {
       .then(record => {
         const residues = record?.residues?.replace(/\*$/, '');
         if (!residues) throw new Error('No peptide sequence found.');
+        SEQUENCE_ERRORS.delete(url);
         return `>${record.organism || row['Hsp_hit-species']}|${row['Hsp_hit-sequenceId']}\n${residues}`;
       })
-      .catch(error => { console.warn('[Phy++] sequence fetch failed:', url, error); return null; });
+      .catch(error => {
+        SEQUENCE_ERRORS.set(url, error);
+        console.warn('[Phy++] sequence fetch failed:', url, error);
+        return null;
+      });
     CACHE.set(url, task);
     return task;
+  }
+
+  async function fetchConservativeSequence(row) {
+    const url = nativeReportUrl(row);
+    const response = await fetch(url, { credentials: 'include' });
+    if (!response.ok) throw new Error(`Protein report returned HTTP ${response.status}.`);
+    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const fasta = extractFastaFromDocument(page);
+    return fasta || readRenderedProteinReport(url);
+  }
+
+  function readRenderedProteinReport(url) {
+    return new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe');
+      let observer;
+      const finish = (error, fasta) => {
+        clearTimeout(timeout);
+        observer?.disconnect();
+        frame.remove();
+        if (error) reject(error); else resolve(fasta);
+      };
+      const inspect = () => {
+        try {
+          const fasta = extractFastaFromDocument(frame.contentDocument);
+          if (fasta) finish(null, fasta);
+        } catch (error) {
+          finish(error);
+        }
+      };
+      const timeout = setTimeout(() => finish(new Error('Timed out waiting for Peptide sequence in the protein report.')), 20000);
+      frame.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;border:0;visibility:hidden';
+      frame.addEventListener('load', () => {
+        const root = frame.contentDocument?.documentElement;
+        if (!root) return finish(new Error('The protein report could not be opened.'));
+        observer = new MutationObserver(inspect);
+        observer.observe(root, { childList: true, subtree: true, characterData: true });
+        inspect();
+      }, { once: true });
+      frame.src = url;
+      document.body.append(frame);
+    });
+  }
+
+  function proteinLabel(row) {
+    return String(row['Hsp_hit-sequenceId'] || row.Hit_accession || 'Unknown protein');
+  }
+
+  async function collectExportSequences(rows, mode) {
+    const fetcher = mode === 'conservative' ? fetchConservativeSequence : fetchNativeSequence;
+    const collected = new Array(rows.length);
+    const failures = [];
+    const loadOne = async (row, index) => {
+      try {
+        const fasta = await fetcher(row);
+        if (!fasta) throw SEQUENCE_ERRORS.get(nativeReportUrl(row)) || new Error('No peptide sequence was returned.');
+        collected[index] = fasta;
+      } catch (error) {
+        failures.push(`${proteinLabel(row)}: ${error.message || 'Unknown error.'}`);
+      }
+    };
+    if (mode === 'conservative') {
+      // Deliberately sequential: each selected G report is read directly and
+      // independently, with no cache or API fallback.
+      for (let index = 0; index < rows.length; index++) await loadOne(rows[index], index);
+    } else {
+      await concurrentMap(rows, loadOne);
+    }
+    if (failures.length) throw new Error(`Export cancelled. ${failures.length} selected protein report(s) failed:\n${failures.join('\n')}`);
+    return collected;
+  }
+
+  function showPhytozomeLoading(message) {
+    const overlay = document.createElement('div');
+    overlay.id = 'phypp-export-loading';
+    overlay.setAttribute('role', 'status');
+    overlay.setAttribute('aria-live', 'polite');
+    overlay.style.cssText = 'position:fixed;z-index:2147483647;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.55)';
+    const panel = document.createElement('div');
+    panel.style.cssText = 'display:flex;align-items:center;gap:10px;padding:14px 18px;background:#fff;border:1px solid #bdbdbd;box-shadow:0 2px 8px #777;color:#333;font:14px Arial,sans-serif';
+    const existingSpinner = document.querySelector('.MuiCircularProgress-root,[role="progressbar"]');
+    const spinner = existingSpinner?.cloneNode(true) || document.createElement('span');
+    if (!existingSpinner) {
+      spinner.className = 'MuiCircularProgress-root';
+      spinner.style.cssText = 'width:22px;height:22px;border:3px solid #d4d4d4;border-top-color:#6ca51b;border-radius:50%;box-sizing:border-box;animation:phypp-spin .8s linear infinite';
+      if (!document.getElementById('phypp-spinner-style')) {
+        const style = document.createElement('style');
+        style.id = 'phypp-spinner-style';
+        style.textContent = '@keyframes phypp-spin{to{transform:rotate(360deg)}}';
+        document.head.append(style);
+      }
+    }
+    const label = document.createElement('span');
+    label.textContent = message;
+    panel.append(spinner, label);
+    overlay.append(panel);
+    document.body.append(overlay);
+    return () => overlay.remove();
+  }
+
+  async function withPhytozomeLoading(message, task) {
+    const dismiss = showPhytozomeLoading(message);
+    try { return await task(); } finally { dismiss(); }
   }
 
   function nativeViewRenderer(params) {
@@ -240,26 +348,40 @@ function phyplusplusMain() {
     document.addEventListener('click', event => {
       if (!menu.hidden && !menu.contains(event.target) && event.target !== button) menu.hidden = true;
     });
-    option('Export FASTA', async () => {
-      const fasta = (await Promise.all(api.getSelectedRows().map(fetchNativeSequence))).filter(Boolean).join('\n\n');
-      if (!fasta) throw new Error('Select at least one row with an available peptide sequence.');
-      await saveFile(fasta, [{ description: 'FASTA sequence', accept: { 'text/plain': ['.fasta', '.fa'] } }]);
-    });
-    option('Export table', async () => {
+    const selectedRows = () => {
       const rows = api.getSelectedRows();
       if (!rows.length) throw new Error('Select at least one result row.');
-      const XLSX = await loadXlsx();
-      // Phytozome currently ships an older AG Grid.  Its displayed columns
-      // live on columnApi, whereas newer releases expose them on grid api.
-      const displayedColumns = api.getAllDisplayedColumns?.()
-        || api.columnApi?.getAllDisplayedColumns?.()
-        || gridOptions.columnDefs.map(definition => ({ getColDef: () => definition }));
-      const columns = displayedColumns.filter(column => column.getColDef().field);
-      const workbook = XLSX.utils.book_new();
-      const sheet = XLSX.utils.aoa_to_sheet([columns.map(column => column.getColDef().headerName), ...rows.map(row => columns.map(column => row[column.getColDef().field]))]);
-      XLSX.utils.book_append_sheet(workbook, sheet, 'Phy++ results');
-      await saveFile(new Blob([XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), [{ description: 'Excel workbook', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }]);
-    });
+      return rows;
+    };
+    const exportFasta = async mode => {
+      const rows = selectedRows();
+      await withPhytozomeLoading(mode === 'conservative' ? 'Reading protein reports...' : 'Preparing FASTA export...', async () => {
+        const fasta = (await collectExportSequences(rows, mode)).join('\n\n');
+        await saveFile(fasta, [{ description: 'FASTA sequence', accept: { 'text/plain': ['.fasta', '.fa'] } }]);
+      });
+    };
+    const exportTable = async mode => {
+      const rows = selectedRows();
+      await withPhytozomeLoading(mode === 'conservative' ? 'Reading protein reports...' : 'Preparing table export...', async () => {
+        const sequences = await collectExportSequences(rows, mode);
+        const XLSX = await loadXlsx();
+        // Phytozome currently ships an older AG Grid. Its displayed columns
+        // live on columnApi, whereas newer releases expose them on grid api.
+        const displayedColumns = api.getAllDisplayedColumns?.()
+          || api.columnApi?.getAllDisplayedColumns?.()
+          || gridOptions.columnDefs.map(definition => ({ getColDef: () => definition }));
+        const columns = displayedColumns.filter(column => column.getColDef().field);
+        const exportRows = rows.map((row, index) => ({ ...row, _phyppPeptide: sequences[index] }));
+        const workbook = XLSX.utils.book_new();
+        const sheet = XLSX.utils.aoa_to_sheet([columns.map(column => column.getColDef().headerName), ...exportRows.map(row => columns.map(column => row[column.getColDef().field]))]);
+        XLSX.utils.book_append_sheet(workbook, sheet, 'Phy++ results');
+        await saveFile(new Blob([XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), [{ description: 'Excel workbook', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }]);
+      });
+    };
+    option('Export FASTA (Standard)', () => exportFasta('standard'));
+    option('Export FASTA (Conservative)', () => exportFasta('conservative'));
+    option('Export table (Standard)', () => exportTable('standard'));
+    option('Export table (Conservative)', () => exportTable('conservative'));
     wrap.append(button);
     exportButton.insertAdjacentElement('afterend', wrap);
   }
