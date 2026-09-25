@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Phy++ for Phytozome
 // @namespace    https://phytozome-next.jgi.doe.gov/
-// @version      3.8.0
+// @version      3.9.0
 // @description  Adds dates, identifiers, sequence tools, and exports to Phytozome.
 // @license      MIT
 // @homepageURL  https://github.com/KiriKirby/phyplusplus
@@ -276,7 +276,7 @@ function phyplusplusMain() {
       { field: '_phyppLink', headerName: 'Link', width: 420, cellRenderer: nativeLinkRenderer, filter: 'agTextColumnFilter' },
       { field: '_phyppPeptide', headerName: 'Peptide sequence', width: 700, cellRenderer: nativePeptideRenderer, filter: 'agTextColumnFilter' },
     );
-    options.rowData.forEach(row => {
+    (options.rowData || []).forEach(row => {
       const queryLength = Number(row['Iteration_query-length']);
       // Keep this numeric, like the native identity column, so AG Grid's
       // number filters and numeric sorting work without string parsing.
@@ -287,7 +287,7 @@ function phyplusplusMain() {
     // Begin API-backed version grouping before the native grid is mounted.
     // The result is calculated once and merely shown/hidden as Protein sorting
     // changes, avoiding repeat work and delayed highlight state.
-    const proteinGroupsReady = loadProteinGroups(options.rowData);
+    const proteinGroupsReady = loadProteinGroups(options.rowData || []);
     const previousReady = options.onGridReady;
     const previousSortChanged = options.onSortChanged;
     options.onSortChanged = event => {
@@ -402,29 +402,33 @@ function phyplusplusMain() {
   // Phytozome's vendor bundle is an array-indexed webpack module table.  This
   // must run before the main bundle consumes that table and constructs AG Grid.
   function hookAgGridModule(modules) {
-    const originalFactory = modules?.[253];
-    if (typeof originalFactory !== 'function' || originalFactory.__phyppWrapped) return;
-    function phyppAgGridModule(module, exports, require) {
-      originalFactory.call(this, module, exports, require);
-      const exported = exports?.AgGridReact || module.exports?.AgGridReact;
-      if (!exported || exported.__phyppWrapped) return;
-      class PhyppAgGridReact extends exported {
-        constructor(props, context) {
-          if (props?.gridOptions) enhanceNativeGridOptions(props.gridOptions);
-          super(props, context);
-        }
+    if (!modules) return;
+    // IDs are regenerated whenever Phytozome rebuilds its vendor bundle.
+    // Match the public AG Grid bridge symbol instead of a bundle-specific ID.
+    Object.entries(modules).forEach(([id, originalFactory]) => {
+      if (typeof originalFactory !== 'function' || originalFactory.__phyppWrapped || !/\bAgGridReact\b/.test(String(originalFactory))) return;
+      function phyppAgGridModule(module, exports, require) {
+        originalFactory.call(this, module, exports, require);
+        const exported = exports?.AgGridReact || module.exports?.AgGridReact;
+        if (!exported || exported.__phyppWrapped) return;
+        class PhyppAgGridReact extends exported {
+          constructor(props, context) {
+            if (props?.gridOptions) enhanceNativeGridOptions(props.gridOptions);
+            super(props, context);
+          }
 
-        componentWillReceiveProps(nextProps, nextContext) {
-          if (nextProps?.gridOptions) enhanceNativeGridOptions(nextProps.gridOptions);
-          return super.componentWillReceiveProps?.(nextProps, nextContext);
+          componentWillReceiveProps(nextProps, nextContext) {
+            if (nextProps?.gridOptions) enhanceNativeGridOptions(nextProps.gridOptions);
+            return super.componentWillReceiveProps?.(nextProps, nextContext);
+          }
         }
+        PhyppAgGridReact.__phyppWrapped = true;
+        if (exports) exports.AgGridReact = PhyppAgGridReact;
+        if (module.exports) module.exports.AgGridReact = PhyppAgGridReact;
       }
-      PhyppAgGridReact.__phyppWrapped = true;
-      if (exports) exports.AgGridReact = PhyppAgGridReact;
-      if (module.exports) module.exports.AgGridReact = PhyppAgGridReact;
-    }
-    phyppAgGridModule.__phyppWrapped = true;
-    modules[253] = phyppAgGridModule;
+      phyppAgGridModule.__phyppWrapped = true;
+      modules[id] = phyppAgGridModule;
+    });
   }
 
   function hookWebpackQueue(queue) {

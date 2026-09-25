@@ -62,12 +62,14 @@ test('injects into the page world and intercepts the native AgGridReact module b
   assert.equal(window.__phyppMainInstalled, true);
 
   class OriginalAgGridReact { constructor(props) { this.props = props; } }
-  // The live vendor bundle uses an array-indexed webpack module table.
+  // The live vendor bundle uses an array-indexed webpack module table. Its
+  // index changes as the production bundle is rebuilt, so the script must
+  // discover the public export instead of relying on an index.
   const modules = [];
-  modules[253] = (module, exports) => { exports.AgGridReact = OriginalAgGridReact; };
+  modules[2104] = (module, exports) => { exports.AgGridReact = OriginalAgGridReact; };
   window.webpackJsonp.push([[99], modules, []]);
   const module = { exports: {} };
-  modules[253](module, module.exports, () => {});
+  modules[2104](module, module.exports, () => {});
 
   const row = {
     uHsp: 'one', Hit_accession: '99', 'Hsp_hit-jbrowseName': 'P_test_v1', 'Hsp_hit-sequenceId': 'protein-1',
